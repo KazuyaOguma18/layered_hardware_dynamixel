@@ -72,6 +72,10 @@ public:
     }
 
     // init actuators with param "actuators/<actuator_name>"
+    // (on_init() may run again on a re-initialized hardware component, and appending to the
+    // previous contents would give the sync read duplicate ids)
+    drivers_.clear();
+    contexts_.clear();
     for (std::size_t i = 0; i < ator_names.size(); ++i) {
       try {
         drivers_.emplace_back(new DynamixelActuatorDriver(ator_names[i], ator_params[i], dxl_wb));
@@ -88,6 +92,10 @@ public:
     // an invalid layout or a negative index just leaves read() on the per-actuator path.
     sync_layout_ = make_sync_state_layout(contexts_);
     sync_handler_index_ = contexts_.empty() ? -1 : add_sync_state_handler(contexts_.front(), sync_layout_);
+    sync_read_failures_ = 0;
+    sync_buffers_.resize(contexts_.size());
+    sync_write_handlers_.ids.reserve(contexts_.size());
+    sync_write_handlers_.values.reserve(contexts_.size());
     if (sync_handler_index_ >= 0) {
       lhd_info("DynamixelActuatorLayer::on_init(): Will read the states of %d actuators with a "
                "single sync read of %d bytes from address %d",
@@ -157,7 +165,17 @@ public:
     // below just convert what is already in their contexts; on failure they fall back to
     // reading the items one by one, which also surfaces which actuator is unresponsive.
     if (sync_handler_index_ >= 0) {
-      sync_read_states(contexts_, sync_layout_, sync_handler_index_);
+      if (sync_read_states(contexts_, sync_layout_, sync_handler_index_, &sync_buffers_)) {
+        sync_read_failures_ = 0;
+      } else if (++sync_read_failures_ >= max_consecutive_sync_read_failures) {
+        // a sync read that keeps failing costs its timeout on top of the per-item fallback,
+        // which is slower than never having tried. re-initializing the hardware component
+        // (the documented recovery path) sets this up again.
+        lhd_warn("DynamixelActuatorLayer::read(): Sync read failed %d times in a row. "
+                 "Reading states actuator by actuator from now on.",
+                 sync_read_failures_);
+        sync_handler_index_ = -1;
+      }
     }
 
     hi::return_type result = hi::return_type::OK;
@@ -173,10 +191,24 @@ public:
   }
 
   virtual hi::return_type write(const rclcpp::Time &time, const rclcpp::Duration &period) override {
-    // write to all actuators
+    // let the operating modes queue their control table writes rather than perform them, so
+    // that the whole bus is written with one sync write per item instead of one blocking
+    // round trip per actuator (11.0 ms each, of which 10 ms is a sleep inside
+    // DynamixelWorkbench::writeRegister())
+    for (const auto &context : contexts_) {
+      context->defer_writes = true;
+    }
+
     hi::return_type result = hi::return_type::OK;
     for (const auto &driver : drivers_) {
       result = lh::merge(result, driver->write(time, period));
+    }
+
+    if (!sync_write_pending(contexts_, &sync_write_handlers_)) {
+      result = lh::merge(result, hi::return_type::ERROR);
+    }
+    for (const auto &context : contexts_) {
+      context->defer_writes = false;
     }
     return result;
   }
@@ -188,6 +220,10 @@ private:
   std::vector<std::shared_ptr<DynamixelActuatorContext>> contexts_;
   SyncStateLayout sync_layout_;
   int sync_handler_index_ = -1;
+  SyncStateBuffers sync_buffers_;
+  SyncWriteHandlers sync_write_handlers_;
+  int sync_read_failures_ = 0;
+  static constexpr int max_consecutive_sync_read_failures = 10;
 };
 } // namespace layered_hardware_dynamixel
 

@@ -2,6 +2,8 @@
 #define LAYERED_HARDWARE_DYNAMIXEL_DYNAMIXEL_WORKBENCH_UTILS_HPP
 
 #include <algorithm> // for std::min(), std::max()
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -172,8 +174,23 @@ make_sync_state_layout(const std::vector<std::shared_ptr<DynamixelActuatorContex
     return SyncStateLayout();
   }
 
+  // every actuator has to agree, because a sync read fetches the same block from all of them.
+  // deciding from the first alone would leave the others' effort unread but marked fresh.
+  std::size_t num_with_effort = 0;
+  for (const auto &context : contexts) {
+    if (has_effort(context)) {
+      ++num_with_effort;
+    }
+  }
+  if (num_with_effort != 0 && num_with_effort != contexts.size()) {
+    lhd_info("make_sync_state_layout(): Only %d of %d actuators on this bus expose "
+             "Present_Current. Falling back to reading states actuator by actuator.",
+             static_cast<int>(num_with_effort), static_cast<int>(contexts.size()));
+    return SyncStateLayout();
+  }
+
   SyncStateLayout layout;
-  layout.has_effort = has_effort(contexts.front());
+  layout.has_effort = num_with_effort == contexts.size();
   for (std::size_t i = 0; i < contexts.size(); ++i) {
     const auto &context = contexts[i];
     const ControlItem *const pos = context->dxl_wb->getItemInfo(context->id, "Present_Position");
@@ -255,6 +272,19 @@ static inline int add_sync_state_handler(const std::shared_ptr<DynamixelActuator
   return index;
 }
 
+// scratch buffers owned by the layer, so that a control cycle allocates nothing
+struct SyncStateBuffers {
+  std::vector<std::uint8_t> ids;
+  std::vector<std::int32_t> pos_values, vel_values, eff_values;
+
+  void resize(const std::size_t size) {
+    ids.resize(size);
+    pos_values.resize(size);
+    vel_values.resize(size);
+    eff_values.resize(size);
+  }
+};
+
 static inline bool get_sync_read_data(const std::shared_ptr<DynamixelWorkbench> &dxl_wb,
                                       const int handler_index, std::vector<std::uint8_t> *const ids,
                                       const std::uint16_t address, const std::uint16_t length,
@@ -276,13 +306,16 @@ static inline bool get_sync_read_data(const std::shared_ptr<DynamixelWorkbench> 
 // so that read_all_states() skips its per-item round trips for this cycle
 static inline bool
 sync_read_states(const std::vector<std::shared_ptr<DynamixelActuatorContext>> &contexts,
-                 const SyncStateLayout &layout, const int handler_index) {
+                 const SyncStateLayout &layout, const int handler_index,
+                 SyncStateBuffers *const buffers) {
   if (!layout.valid || handler_index < 0 || contexts.size() != layout.ids.size()) {
     return false;
   }
 
   const std::shared_ptr<DynamixelWorkbench> &dxl_wb = contexts.front()->dxl_wb;
-  std::vector<std::uint8_t> ids = layout.ids;
+  buffers->resize(contexts.size());
+  std::vector<std::uint8_t> &ids = buffers->ids;
+  ids = layout.ids;
   const char *log = nullptr;
   if (!dxl_wb->syncRead(static_cast<std::uint8_t>(handler_index), ids.data(),
                         static_cast<std::uint8_t>(ids.size()), &log)) {
@@ -292,7 +325,9 @@ sync_read_states(const std::vector<std::shared_ptr<DynamixelActuatorContext>> &c
     return false;
   }
 
-  std::vector<std::int32_t> pos_values(ids.size()), vel_values(ids.size()), eff_values(ids.size());
+  std::vector<std::int32_t> &pos_values = buffers->pos_values;
+  std::vector<std::int32_t> &vel_values = buffers->vel_values;
+  std::vector<std::int32_t> &eff_values = buffers->eff_values;
   if (!get_sync_read_data(dxl_wb, handler_index, &ids, layout.pos_address, layout.pos_length,
                           &pos_values) ||
       !get_sync_read_data(dxl_wb, handler_index, &ids, layout.vel_address, layout.vel_length,
@@ -384,43 +419,174 @@ static inline bool write_item(const std::shared_ptr<DynamixelActuatorContext> &c
   return true;
 }
 
-static inline bool
-write_position_command(const std::shared_ptr<DynamixelActuatorContext> &context) {
+// queues a control table write for the layer to send as part of a sync write, or performs it
+// immediately when no one is going to flush the queue. writing item by item costs 11.0 ms each
+// because DynamixelWorkbench::writeRegister() sleeps 10 ms after every write; a sync write of
+// the whole bus costs well under a millisecond and does not sleep at all.
+static inline bool queue_item(const std::shared_ptr<DynamixelActuatorContext> &context,
+                              const char *const item, const std::int32_t value) {
+  if (!context->defer_writes || context->num_pending_writes >= context->pending_writes.size()) {
+    return write_item(context, item, value);
+  }
   const char *log = nullptr;
-  if (!context->dxl_wb->goalPosition(context->id, static_cast<float>(context->pos_cmd), &log)) {
-    lhd_error("write_position_command(): Failed to set goal position of %s: %s",
-              get_display_name(*context),
-              (log ? log : "No log from DynamixelWorkbench::goalPosition()"));
+  const ControlItem *const info = context->dxl_wb->getItemInfo(context->id, item, &log);
+  if (!info) {
+    lhd_error("queue_item(): %s does not have the control table item \"%s\": %s",
+              get_display_name(*context), item,
+              (log ? log : "No log from DynamixelWorkbench::getItemInfo()"));
     return false;
   }
+  context->pending_writes[context->num_pending_writes] = {item, info->address, info->data_length,
+                                                          value};
+  ++context->num_pending_writes;
   return true;
+}
+
+static inline bool
+write_position_command(const std::shared_ptr<DynamixelActuatorContext> &context) {
+  return queue_item(
+      context, "Goal_Position",
+      context->dxl_wb->convertRadian2Value(context->id, static_cast<float>(context->pos_cmd)));
 }
 
 static inline bool
 write_velocity_command(const std::shared_ptr<DynamixelActuatorContext> &context) {
-  const char *log = nullptr;
-  if (!context->dxl_wb->goalVelocity(context->id, static_cast<float>(context->vel_cmd), &log)) {
-    lhd_error("write_velocity_command(): Failed to set goal velocity of %s: %s",
-              get_display_name(*context),
-              (log ? log : "No log from DynamixelWorkbench::goalVelocity()"));
-    return false;
-  }
-  return true;
+  return queue_item(
+      context, "Goal_Velocity",
+      context->dxl_wb->convertVelocity2Value(context->id, static_cast<float>(context->vel_cmd)));
 }
 
 static inline bool
 write_profile_velocity(const std::shared_ptr<DynamixelActuatorContext> &context) {
-  return write_item(context, "Profile_Velocity",
+  return queue_item(context, "Profile_Velocity",
                     context->dxl_wb->convertVelocity2Value(
                         context->id, static_cast<float>(std::abs(context->vel_cmd))));
 }
 
 static inline bool write_effort_command(const std::shared_ptr<DynamixelActuatorContext> &context) {
   // N*m -> mA
-  return write_item(
+  return queue_item(
       context, "Goal_Current",
       context->dxl_wb->convertCurrent2Value(
           context->id, static_cast<float>(context->eff_cmd / context->torque_constant * 1000.0)));
+}
+
+// caches one sync write handler per control table item written by the operating modes.
+// DynamixelWorkbench allows MAX_HANDLER_NUM (5) handlers in total, one of which the sync read
+// takes, so an exotic mix of modes can exhaust them and falls back to the blocking path.
+struct SyncWriteHandlers {
+  static constexpr std::size_t capacity = 4;
+  std::array<std::uint32_t, capacity> keys{};
+  std::array<int, capacity> indices{};
+  std::size_t size = 0;
+  // scratch buffers, so that a control cycle allocates nothing
+  std::vector<std::uint8_t> ids;
+  std::vector<std::int32_t> values;
+
+  static std::uint32_t key_of(const std::uint16_t address, const std::uint16_t length) {
+    return (static_cast<std::uint32_t>(address) << 16) | length;
+  }
+
+  // returns the handler index for the item, registering one on first use, or a negative
+  // value if DynamixelWorkbench cannot take another handler
+  int index_for(const std::shared_ptr<DynamixelWorkbench> &dxl_wb, const std::uint16_t address,
+                const std::uint16_t length) {
+    const std::uint32_t key = key_of(address, length);
+    for (std::size_t i = 0; i < size; ++i) {
+      if (keys[i] == key) {
+        return indices[i];
+      }
+    }
+    if (size >= capacity) {
+      return -1;
+    }
+    const int index = dxl_wb->getTheNumberOfSyncWriteHandler();
+    const char *log = nullptr;
+    if (!dxl_wb->addSyncWriteHandler(address, length, &log)) {
+      lhd_error("SyncWriteHandlers::index_for(): Failed to add a sync write handler of %d bytes "
+                "to address %d: %s",
+                length, address,
+                (log ? log : "No log from DynamixelWorkbench::addSyncWriteHandler()"));
+      return -1;
+    }
+    keys[size] = key;
+    indices[size] = index;
+    ++size;
+    return index;
+  }
+};
+
+// sends every queued write with one sync write per control table item, and clears the queues.
+// an item the handlers cannot cover, or a sync write that fails to reach the bus, falls back to
+// the blocking per-actuator path so that no command is silently dropped.
+static inline bool
+sync_write_pending(const std::vector<std::shared_ptr<DynamixelActuatorContext>> &contexts,
+                   SyncWriteHandlers *const handlers) {
+  if (contexts.empty()) {
+    return true;
+  }
+
+  bool all_written = true;
+  while (true) {
+    // pick the item of the first write still queued anywhere on the bus
+    const PendingWrite *item = nullptr;
+    for (const auto &context : contexts) {
+      if (context->num_pending_writes > 0) {
+        item = &context->pending_writes[0];
+        break;
+      }
+    }
+    if (!item) {
+      return all_written;
+    }
+
+    // collect that item's value from every actuator that has one queued
+    const char *const item_name = item->item;
+    const std::uint16_t address = item->address, length = item->length;
+    handlers->ids.clear();
+    handlers->values.clear();
+    for (const auto &context : contexts) {
+      for (std::size_t i = 0; i < context->num_pending_writes; ++i) {
+        const PendingWrite &pending = context->pending_writes[i];
+        if (pending.address != address || pending.length != length) {
+          continue;
+        }
+        handlers->ids.push_back(context->id);
+        handlers->values.push_back(pending.value);
+        // remove it from the queue by shifting the rest down
+        for (std::size_t k = i + 1; k < context->num_pending_writes; ++k) {
+          context->pending_writes[k - 1] = context->pending_writes[k];
+        }
+        --context->num_pending_writes;
+        break;
+      }
+    }
+
+    const std::shared_ptr<DynamixelWorkbench> &dxl_wb = contexts.front()->dxl_wb;
+    const int handler_index = handlers->index_for(dxl_wb, address, length);
+    const char *log = nullptr;
+    const bool sent =
+        handler_index >= 0 &&
+        dxl_wb->syncWrite(static_cast<std::uint8_t>(handler_index), handlers->ids.data(),
+                          static_cast<std::uint8_t>(handlers->ids.size()), handlers->values.data(),
+                          1, &log);
+    if (sent) {
+      continue;
+    }
+
+    lhd_error("sync_write_pending(): Failed to sync write \"%s\" to %d actuators (%s). "
+              "Falling back to writing them one by one.",
+              item_name, static_cast<int>(handlers->ids.size()),
+              (log ? log : "no sync write handler available"));
+    for (std::size_t i = 0; i < handlers->ids.size(); ++i) {
+      for (const auto &context : contexts) {
+        if (context->id == handlers->ids[i]) {
+          all_written = write_item(context, item_name, handlers->values[i]) && all_written;
+          break;
+        }
+      }
+    }
+  }
 }
 
 } // namespace layered_hardware_dynamixel

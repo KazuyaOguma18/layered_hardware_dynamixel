@@ -1,6 +1,8 @@
 #ifndef LAYERED_HARDWARE_DYNAMIXEL_DYNAMIXEL_ACTUATOR_CONTEXT_HPP
 #define LAYERED_HARDWARE_DYNAMIXEL_DYNAMIXEL_ACTUATOR_CONTEXT_HPP
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <sstream>
@@ -9,6 +11,16 @@
 #include <dynamixel_workbench_toolbox/dynamixel_workbench.h>
 
 namespace layered_hardware_dynamixel {
+
+// a control table write queued by an operating mode, to be sent by DynamixelActuatorLayer
+// together with those of the other actuators on the bus. DynamixelWorkbench::writeRegister()
+// sleeps 10 ms after every register write (measured: a write costs 11.0 ms against 1.0 ms for
+// the identical round trip of a read), which a sync write skips entirely.
+struct PendingWrite {
+  const char *item = nullptr; // a string literal, kept for the blocking fallback path
+  std::uint16_t address = 0, length = 0;
+  std::int32_t value = 0;
+};
 
 struct DynamixelActuatorContext {
   // handles
@@ -31,6 +43,15 @@ struct DynamixelActuatorContext {
   bool states_fresh = false;
 
   // commands
+  // the most writes an operating mode queues in one cycle (current-based position mode
+  // writes profile velocity, effort limit and goal position)
+  static constexpr std::size_t max_pending_writes = 3;
+  std::array<PendingWrite, max_pending_writes> pending_writes{};
+  std::size_t num_pending_writes = 0;
+  // set by DynamixelActuatorLayer only while it is able to flush the queue. writes made
+  // outside its write(), such as enabling torque on a mode switch, go out immediately.
+  bool defer_writes = false;
+
   double pos_cmd = std::numeric_limits<double>::quiet_NaN(),
          vel_cmd = std::numeric_limits<double>::quiet_NaN(),
          eff_cmd = std::numeric_limits<double>::quiet_NaN();
