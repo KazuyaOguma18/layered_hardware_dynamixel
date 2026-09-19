@@ -15,7 +15,9 @@
 #include <layered_hardware/merge_utils.hpp>
 #include <layered_hardware/string_registry.hpp>
 #include <layered_hardware_dynamixel/common_namespaces.hpp>
+#include <layered_hardware_dynamixel/dynamixel_actuator_context.hpp>
 #include <layered_hardware_dynamixel/dynamixel_actuator_driver.hpp>
+#include <layered_hardware_dynamixel/dynamixel_workbench_utils.hpp>
 #include <layered_hardware_dynamixel/logging_utils.hpp>
 #include <rclcpp/duration.hpp>
 #include <rclcpp/time.hpp>
@@ -78,7 +80,19 @@ public:
                   ator_names[i]);
         return CallbackReturn::ERROR;
       }
+      contexts_.push_back(drivers_.back()->context());
       lhd_info("DynamixelActuatorLayer::on_init(): Initialized the actuator \"%s\"", ator_names[i]);
+    }
+
+    // prepare to read the states of all the actuators on this bus in one round trip.
+    // an invalid layout or a negative index just leaves read() on the per-actuator path.
+    sync_layout_ = make_sync_state_layout(contexts_);
+    sync_handler_index_ = contexts_.empty() ? -1 : add_sync_state_handler(contexts_.front(), sync_layout_);
+    if (sync_handler_index_ >= 0) {
+      lhd_info("DynamixelActuatorLayer::on_init(): Will read the states of %d actuators with a "
+               "single sync read of %d bytes from address %d",
+               static_cast<int>(contexts_.size()), sync_layout_.block_length,
+               sync_layout_.block_address);
     }
 
     return CallbackReturn::SUCCESS;
@@ -139,9 +153,21 @@ public:
 
   virtual hi::return_type read(const rclcpp::Time &time, const rclcpp::Duration &period) override {
     // read from all actuators
+    // fill every actuator's states with one sync read if possible. on success the drivers
+    // below just convert what is already in their contexts; on failure they fall back to
+    // reading the items one by one, which also surfaces which actuator is unresponsive.
+    if (sync_handler_index_ >= 0) {
+      sync_read_states(contexts_, sync_layout_, sync_handler_index_);
+    }
+
     hi::return_type result = hi::return_type::OK;
     for (const auto &driver : drivers_) {
       result = lh::merge(result, driver->read(time, period));
+    }
+
+    // the sync read result is only valid for this cycle
+    for (const auto &context : contexts_) {
+      context->states_fresh = false;
     }
     return result;
   }
@@ -157,6 +183,11 @@ public:
 
 private:
   std::vector<std::unique_ptr<DynamixelActuatorDriver>> drivers_;
+
+  // the contexts of drivers_, in the same order, so that the whole bus can be read at once
+  std::vector<std::shared_ptr<DynamixelActuatorContext>> contexts_;
+  SyncStateLayout sync_layout_;
+  int sync_handler_index_ = -1;
 };
 } // namespace layered_hardware_dynamixel
 

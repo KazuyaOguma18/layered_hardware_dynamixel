@@ -24,6 +24,12 @@ struct DynamixelActuatorContext {
          vel = std::numeric_limits<double>::quiet_NaN(),
          eff = std::numeric_limits<double>::quiet_NaN();
 
+  // set by DynamixelActuatorLayer when it has already filled pos/vel/eff for this
+  // cycle with a single sync read covering the whole bus. read_all_states() then
+  // skips its per-item round trips. cleared at the end of the layer's read(), so
+  // a sync read failure simply falls back to the per-item path.
+  bool states_fresh = false;
+
   // commands
   double pos_cmd = std::numeric_limits<double>::quiet_NaN(),
          vel_cmd = std::numeric_limits<double>::quiet_NaN(),

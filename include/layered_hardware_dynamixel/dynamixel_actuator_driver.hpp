@@ -77,6 +77,9 @@ public:
     switch_operating_modes(/* new_mode = */ nullptr);
   }
 
+  // the owning layer needs the context to fill states with a bus-wide sync read
+  const std::shared_ptr<DynamixelActuatorContext> &context() const { return context_; }
+
   std::vector<hi::StateInterface> export_state_interfaces() {
     // export reference to actuator states owned by this actuator
     std::vector<hi::StateInterface> ifaces;
