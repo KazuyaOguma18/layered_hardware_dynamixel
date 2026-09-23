@@ -472,13 +472,19 @@ static inline bool write_effort_command(const std::shared_ptr<DynamixelActuatorC
 }
 
 // caches one sync write handler per control table item written by the operating modes.
-// DynamixelWorkbench allows MAX_HANDLER_NUM (5) handlers in total, one of which the sync read
-// takes, so an exotic mix of modes can exhaust them and falls back to the blocking path.
+// DynamixelWorkbench keeps separate arrays for sync read and sync write handlers, each of
+// MAX_HANDLER_NUM (5) entries, so the sync read does not compete for these. the capacity
+// below is the number of distinct items the operating modes can write (Goal_Position,
+// Goal_Velocity, Goal_Current, Profile_Velocity); an item beyond that falls back to the
+// blocking path.
 struct SyncWriteHandlers {
   static constexpr std::size_t capacity = 4;
   std::array<std::uint32_t, capacity> keys{};
   std::array<int, capacity> indices{};
   std::size_t size = 0;
+  // the layer's write() runs at the control rate, so a persistent failure must not
+  // log every cycle. the fallback itself is reported once.
+  bool fallback_reported = false;
   // scratch buffers, so that a control cycle allocates nothing
   std::vector<std::uint8_t> ids;
   std::vector<std::int32_t> values;
@@ -507,6 +513,10 @@ struct SyncWriteHandlers {
                 "to address %d: %s",
                 length, address,
                 (log ? log : "No log from DynamixelWorkbench::addSyncWriteHandler()"));
+      // remember the failure so that the control loop does not retry and log it every cycle
+      keys[size] = key;
+      indices[size] = -1;
+      ++size;
       return -1;
     }
     keys[size] = key;
@@ -546,20 +556,30 @@ sync_write_pending(const std::vector<std::shared_ptr<DynamixelActuatorContext>> 
     handlers->ids.clear();
     handlers->values.clear();
     for (const auto &context : contexts) {
-      for (std::size_t i = 0; i < context->num_pending_writes; ++i) {
-        const PendingWrite &pending = context->pending_writes[i];
-        if (pending.address != address || pending.length != length) {
-          continue;
-        }
-        handlers->ids.push_back(context->id);
-        handlers->values.push_back(pending.value);
-        // remove it from the queue by shifting the rest down
-        for (std::size_t k = i + 1; k < context->num_pending_writes; ++k) {
-          context->pending_writes[k - 1] = context->pending_writes[k];
-        }
-        --context->num_pending_writes;
-        break;
+      // only the head of each queue is eligible, so that the order in which an
+      // operating mode queued its writes is preserved. extended position and
+      // current-based position modes write Profile_Velocity or Goal_Current and
+      // then Goal_Position, because the goal position is what makes the new
+      // profile take effect. taking a later entry first would send the goal
+      // position before the profile, and the next cycle would not resend it
+      // (its "changed" guard is already satisfied), leaving the new profile
+      // velocity inactive until the position command happens to change again.
+      // an actuator whose head is a different item simply waits for the next
+      // round; a sync write costs 0.004 ms, so extra rounds are free.
+      if (context->num_pending_writes == 0) {
+        continue;
       }
+      const PendingWrite &pending = context->pending_writes[0];
+      if (pending.address != address || pending.length != length) {
+        continue;
+      }
+      handlers->ids.push_back(context->id);
+      handlers->values.push_back(pending.value);
+      // remove it from the queue by shifting the rest down
+      for (std::size_t k = 1; k < context->num_pending_writes; ++k) {
+        context->pending_writes[k - 1] = context->pending_writes[k];
+      }
+      --context->num_pending_writes;
     }
 
     const std::shared_ptr<DynamixelWorkbench> &dxl_wb = contexts.front()->dxl_wb;
@@ -574,10 +594,14 @@ sync_write_pending(const std::vector<std::shared_ptr<DynamixelActuatorContext>> 
       continue;
     }
 
-    lhd_error("sync_write_pending(): Failed to sync write \"%s\" to %d actuators (%s). "
-              "Falling back to writing them one by one.",
-              item_name, static_cast<int>(handlers->ids.size()),
-              (log ? log : "no sync write handler available"));
+    if (!handlers->fallback_reported) {
+      handlers->fallback_reported = true;
+      lhd_error("sync_write_pending(): Failed to sync write \"%s\" to %d actuators (%s). "
+                "Falling back to writing them one by one, which costs about 11 ms each. "
+                "This is reported once; further failures are silent.",
+                item_name, static_cast<int>(handlers->ids.size()),
+                (log ? log : "no sync write handler available"));
+    }
     for (std::size_t i = 0; i < handlers->ids.size(); ++i) {
       for (const auto &context : contexts) {
         if (context->id == handlers->ids[i]) {
